@@ -2,7 +2,7 @@
  * @name LocalTimeInline
  * @author Nicepower001
  * @description Replaces time information into local time information.
- * @version 1.0.0
+ * @version 1.1.0
  */
 
 module.exports = class LocalTimeInline {
@@ -14,9 +14,13 @@ module.exports = class LocalTimeInline {
         this.mutating = false;
         this.formatterCache = new Map();
         this.zoneMap = new Map();
-        const month = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
-        const time = "\\d{1,2}(?::\\d{2})?\\s*(?:a\\.?m\\.?|p\\.?m\\.?)?";
-        this.entryRegex = new RegExp(`(?:(${month}\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,\\s*\\d{4})?)\\s*,?\\s*)?(${time})(?:\\s*(?:-|–|—|to)\\s*(${time}))?`, "gi");
+        this.defaultLocalTimeZone = "Europe/Berlin";
+        this.storageKey = "local-time-inline-timezone";
+        this.monthDatePattern = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s*\\d{4})?";
+        this.numericDatePattern = "\\d{1,2}[./-]\\d{1,2}(?:[./-]\\d{2,4})";
+        const time = "\\d{1,2}(?::\\d{2}){0,2}\\s*(?:a\\.?m\\.?|p\\.?m\\.?)?";
+        const leadingDate = `(${this.monthDatePattern}|${this.numericDatePattern})`;
+        this.entryRegex = new RegExp(`(?:${leadingDate}\\s*,?\\s*)?(${time})(?:\\s*(?:-|–|—|to)\\s*(${time}))?`, "gi");
     }
 
     start() {
@@ -52,10 +56,16 @@ module.exports = class LocalTimeInline {
 
     getLocalTimeZone() {
         try {
-            return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-        } catch {
-            return "UTC";
-        }
+            const saved = typeof localStorage !== "undefined" ? localStorage.getItem(this.storageKey) : null;
+            if (saved && this.isValidTimeZone(saved)) return saved;
+        } catch {}
+
+        try {
+            const detected = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            if (detected && this.isValidTimeZone(detected)) return detected;
+        } catch {}
+
+        return this.defaultLocalTimeZone;
     }
 
     buildZoneMap() {
@@ -236,38 +246,71 @@ module.exports = class LocalTimeInline {
 
         let match;
         while ((match = this.entryRegex.exec(text)) !== null) {
-            const dateText = match[1] || null;
+            const leadingDateText = match[1] || null;
             const firstTime = match[2];
             const secondTime = match[3] || null;
-            const zoneMatch = this.parseZoneAt(text, match.index + match[0].length);
+
+            let zoneMatch = this.parseZoneAt(text, match.index + match[0].length);
+            let trailingDate = null;
+            let dateText = leadingDateText;
+            let explicitDate = Boolean(dateText);
+
+            if (!zoneMatch && !leadingDateText) {
+                const dateThenZone = this.parseDateThenZoneAt(text, match.index + match[0].length);
+                if (dateThenZone) {
+                    zoneMatch = { zoneInfo: dateThenZone.zoneInfo, end: dateThenZone.end };
+                    dateText = dateThenZone.dateText;
+                    explicitDate = true;
+                }
+            }
 
             if (!zoneMatch) {
                 if (match[0].length === 0) this.entryRegex.lastIndex++;
                 continue;
             }
 
+            if (!dateText) {
+                trailingDate = this.parseAdjacentDateAt(text, zoneMatch.end);
+                if (trailingDate) {
+                    dateText = trailingDate.value;
+                    explicitDate = true;
+                }
+            }
+
             let label = null;
 
             if (secondTime) {
-                const left = this.convert(dateText, firstTime, zoneMatch.zoneInfo);
-                const right = this.convert(dateText, secondTime, zoneMatch.zoneInfo);
+                const left = this.convert(dateText, firstTime, zoneMatch.zoneInfo, explicitDate);
+                const right = this.convert(dateText, secondTime, zoneMatch.zoneInfo, explicitDate);
                 if (left && right) {
-                    const leftText = left.dayText ? `${left.display} ${left.dayText}` : left.display;
-                    const rightText = right.dayText ? `${right.display} ${right.dayText}` : right.display;
+                    const leftText = explicitDate
+                        ? `${left.display} ${left.localDateText}`
+                        : (left.dayText ? `${left.display} ${left.dayText}` : left.display);
+
+                    const rightText = explicitDate
+                        ? `${right.display} ${right.localDateText}`
+                        : (right.dayText ? `${right.display} ${right.dayText}` : right.display);
+
                     label = `${leftText}–${rightText}`;
                 }
             } else {
-                const converted = this.convert(dateText, firstTime, zoneMatch.zoneInfo);
-                if (converted) label = converted.dayText ? `${converted.display} ${converted.dayText}` : converted.display;
+                const converted = this.convert(dateText, firstTime, zoneMatch.zoneInfo, explicitDate);
+                if (converted) {
+                    label = explicitDate
+                        ? `${converted.display} ${converted.localDateText}`
+                        : (converted.dayText ? `${converted.display} ${converted.dayText}` : converted.display);
+                }
             }
 
             if (label) {
-                const fullMatchText = text.slice(match.index, zoneMatch.end);
+                const replaceEnd = trailingDate ? trailingDate.end : zoneMatch.end;
+                const fullMatchText = text.slice(match.index, replaceEnd);
                 const timeOffset = fullMatchText.indexOf(firstTime);
+
                 if (timeOffset !== -1) {
                     matches.push({
                         replaceStart: match.index + timeOffset,
-                        end: zoneMatch.end,
+                        end: replaceEnd,
                         label
                     });
                 }
@@ -329,6 +372,36 @@ module.exports = class LocalTimeInline {
         };
     }
 
+    parseAdjacentDateAt(text, index) {
+        const tail = text.slice(index);
+        const match = tail.match(new RegExp(`^[\\s,()\\[\\]-]*(${this.monthDatePattern}|${this.numericDatePattern})\\b`, "i"));
+        if (!match) return null;
+
+        const leading = tail.indexOf(match[1]);
+        return {
+            value: match[1],
+            end: index + leading + match[1].length
+        };
+    }
+
+    parseDateThenZoneAt(text, index) {
+        const tail = text.slice(index);
+        const dateMatch = tail.match(new RegExp(`^[\\s/,-]*(${this.monthDatePattern}|${this.numericDatePattern})`, "i"));
+        if (!dateMatch) return null;
+
+        const dateText = dateMatch[1];
+        const dateStart = tail.indexOf(dateText);
+        const afterDate = index + dateStart + dateText.length;
+        const zoneMatch = this.parseZoneAt(text, afterDate);
+        if (!zoneMatch) return null;
+
+        return {
+            dateText,
+            zoneInfo: zoneMatch.zoneInfo,
+            end: zoneMatch.end
+        };
+    }
+
     parseOffsetZone(value) {
         const compact = value.replace(/\s+/g, "").toUpperCase();
         const match = compact.match(/^(UTC|GMT)([+-]\d{1,2}(?::?\d{2})?)?$/);
@@ -352,30 +425,29 @@ module.exports = class LocalTimeInline {
     parseTime(input) {
         const value = input.trim().replace(/\./g, "").replace(/\s+/g, " ").toLowerCase();
 
-        let match = value.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap]m)$/);
+        let match = value.match(/^(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?\s*([ap]m)$/);
         if (match) {
             let hour = Number(match[1]);
             const minute = Number(match[2] || "0");
-            const meridiem = match[3];
-            if (hour < 1 || hour > 12 || minute < 0 || minute > 59) return null;
+            const second = Number(match[3] || "0");
+            const meridiem = match[4];
+
+            if (hour < 1 || hour > 12 || minute < 0 || minute > 59 || second < 0 || second > 59) return null;
             if (meridiem === "pm" && hour !== 12) hour += 12;
             if (meridiem === "am" && hour === 12) hour = 0;
-            return { hour, minute };
+
+            return { hour, minute, second };
         }
 
-        match = value.match(/^(\d{1,2}):(\d{2})$/);
+        match = value.match(/^(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?$/);
         if (match) {
             const hour = Number(match[1]);
-            const minute = Number(match[2]);
-            if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
-            return { hour, minute };
-        }
+            const minute = Number(match[2] || "0");
+            const second = Number(match[3] || "0");
 
-        match = value.match(/^(\d{1,2})$/);
-        if (match) {
-            const hour = Number(match[1]);
-            if (hour < 0 || hour > 23) return null;
-            return { hour, minute: 0 };
+            if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return null;
+
+            return { hour, minute, second };
         }
 
         return null;
@@ -383,38 +455,55 @@ module.exports = class LocalTimeInline {
 
     parseDate(input, zoneInfo) {
         const cleaned = input.trim().replace(/,/g, "");
-        const match = cleaned.match(/^(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?$/i);
-        if (!match) return this.getCurrentDateParts(zoneInfo);
 
-        const months = {
-            jan: 1, january: 1,
-            feb: 2, february: 2,
-            mar: 3, march: 3,
-            apr: 4, april: 4,
-            may: 5,
-            jun: 6, june: 6,
-            jul: 7, july: 7,
-            aug: 8, august: 8,
-            sep: 9, sept: 9, september: 9,
-            oct: 10, october: 10,
-            nov: 11, november: 11,
-            dec: 12, december: 12
-        };
+        const monthMatch = cleaned.match(
+            /^(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?$/i
+        );
+        if (monthMatch) {
+            const months = {
+                jan: 1, january: 1,
+                feb: 2, february: 2,
+                mar: 3, march: 3,
+                apr: 4, april: 4,
+                may: 5,
+                jun: 6, june: 6,
+                jul: 7, july: 7,
+                aug: 8, august: 8,
+                sep: 9, sept: 9, september: 9,
+                oct: 10, october: 10,
+                nov: 11, november: 11,
+                dec: 12, december: 12
+            };
 
-        const month = months[match[1].toLowerCase()];
-        const day = Number(match[2]);
-        let year = match[3] ? Number(match[3]) : null;
+            const month = months[monthMatch[1].toLowerCase()];
+            const day = Number(monthMatch[2]);
+            let year = monthMatch[3] ? Number(monthMatch[3]) : null;
 
-        if (!year) {
-            const base = this.getCurrentDateParts(zoneInfo);
-            year = base.year;
+            if (!year) {
+                const base = this.getCurrentDateParts(zoneInfo);
+                year = base.year;
+            }
+
+            if (!month || day < 1 || day > 31) return null;
+            return { year, month, day };
         }
 
-        if (!month || day < 1 || day > 31) return null;
-        return { year, month, day };
+        const numericMatch = cleaned.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+        if (numericMatch) {
+            const day = Number(numericMatch[1]);
+            const month = Number(numericMatch[2]);
+            let year = Number(numericMatch[3]);
+
+            if (year < 100) year += year >= 70 ? 1900 : 2000;
+            if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+            return { year, month, day };
+        }
+
+        return this.getCurrentDateParts(zoneInfo);
     }
 
-    convert(dateText, timeText, zoneInfo) {
+    convert(dateText, timeText, zoneInfo, explicitDate = Boolean(dateText)) {
         const parsedTime = this.parseTime(timeText);
         if (!parsedTime) return null;
 
@@ -430,7 +519,7 @@ module.exports = class LocalTimeInline {
                 sourceDate.day,
                 parsedTime.hour,
                 parsedTime.minute,
-                0
+                parsedTime.second || 0
             ) - zoneInfo.offsetMinutes * 60000);
         } else {
             utcDate = this.zonedTimeToUtc(
@@ -439,23 +528,22 @@ module.exports = class LocalTimeInline {
                 sourceDate.month,
                 sourceDate.day,
                 parsedTime.hour,
-                parsedTime.minute
+                parsedTime.minute,
+                parsedTime.second || 0
             );
         }
 
         if (!(utcDate instanceof Date) || Number.isNaN(utcDate.getTime())) return null;
 
-        const localDate = {
-            year: utcDate.getFullYear(),
-            month: utcDate.getMonth() + 1,
-            day: utcDate.getDate()
-        };
+        const targetZone = this.isValidTimeZone(this.currentZone) ? this.currentZone : this.defaultLocalTimeZone;
+        const localDate = this.getZonedParts(utcDate, targetZone);
 
         const dayShift = this.dayCode(localDate.year, localDate.month, localDate.day) - this.dayCode(sourceDate.year, sourceDate.month, sourceDate.day);
 
         return {
             display: this.formatLocalTime(utcDate),
-            dayText: this.dayShiftLabel(dayShift)
+            localDateText: explicitDate ? this.formatLocalDate(utcDate) : "",
+            dayText: explicitDate ? "" : this.dayShiftLabel(dayShift)
         };
     }
 
@@ -508,9 +596,9 @@ module.exports = class LocalTimeInline {
         };
     }
 
-    zonedTimeToUtc(timeZone, year, month, day, hour, minute) {
-        let utcMillis = Date.UTC(year, month - 1, day, hour, minute, 0);
-        const target = Date.UTC(year, month - 1, day, hour, minute, 0);
+    zonedTimeToUtc(timeZone, year, month, day, hour, minute, second = 0) {
+        let utcMillis = Date.UTC(year, month - 1, day, hour, minute, second);
+        const target = Date.UTC(year, month - 1, day, hour, minute, second);
 
         for (let i = 0; i < 6; i++) {
             const parts = this.getZonedParts(new Date(utcMillis), timeZone);
@@ -524,12 +612,29 @@ module.exports = class LocalTimeInline {
     }
 
     formatLocalTime(date) {
+        const zone = this.isValidTimeZone(this.currentZone) ? this.currentZone : this.defaultLocalTimeZone;
         const formatter = this.getFormatter(
-            "local",
+            "local:" + zone,
             () => new Intl.DateTimeFormat(undefined, {
+                timeZone: zone,
                 hour: "2-digit",
                 minute: "2-digit",
+                second: "2-digit",
                 hourCycle: "h23"
+            })
+        );
+        return formatter.format(date);
+    }
+
+    formatLocalDate(date) {
+        const zone = this.isValidTimeZone(this.currentZone) ? this.currentZone : this.defaultLocalTimeZone;
+        const formatter = this.getFormatter(
+            "local-date:" + zone,
+            () => new Intl.DateTimeFormat(undefined, {
+                timeZone: zone,
+                year: "numeric",
+                month: "2-digit",
+                day: "2-digit"
             })
         );
         return formatter.format(date);
